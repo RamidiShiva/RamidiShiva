@@ -1,0 +1,143 @@
+---
+- name: provision ec2 instance
+  hosts: servers
+  become: yes
+  gather_facts: yes
+  vars:
+    home_dir: "/home/ubuntu"
+    file_owner: ubuntu
+    gossamer_repo_dir: "/opt/gossamer"
+    promtail_dir: "/opt/promtail"
+
+  tasks:
+    - name: Wait 300 seconds, but only start checking after 20 seconds
+      wait_for_connection:
+        delay: 25
+        timeout: 500
+
+    - debug: msg="play_hosts={{play_hosts}}"
+
+    - name: set up multiple authorized keys
+      authorized_key:
+        user: "{{ file_owner }}"
+        exclusive: no
+        state: present
+        key: "{{ lookup('file', item) }}"
+      with_fileglob:
+        - ./ssh_keys/*
+
+    - name: install packages via apt
+      apt: 
+        name: 
+          - git
+          - wget
+          - curl
+          - make
+          - gcc
+          - unzip
+        state: latest
+
+    - name: Install packages via snap
+      community.general.snap:
+        classic: yes
+        name:
+          - go
+          - figlet
+
+    - name: generate motd 
+      ansible.builtin.file:
+        path: /etc/motd
+        state: touch
+        mode: u=rw,g=rw,o=rw
+          
+    - name: register motd
+      shell: figlet Gossamer >> /etc/motd
+      become: yes
+          
+
+    - name: clone gossamer repo
+      ansible.builtin.git:
+        repo: https://github.com/ChainSafe/gossamer.git
+        dest: "{{gossamer_repo_dir}}"
+
+    - name: make gossamer
+      community.general.make:
+        chdir: "{{gossamer_repo_dir}}"
+        target: gossamer
+      
+    - name: make directory
+      file:
+        path: "/opt/promtail"
+        state: directory
+        owner: "{{ file_owner }}"
+        group: "{{ file_owner }}"
+        mode: 775
+
+    - name: promtail download & unarchive
+      ansible.builtin.unarchive:
+        src: "https://github.com/grafana/loki/releases/download/v2.0.0/promtail-linux-amd64.zip"
+        dest: "{{promtail_dir}}"
+        remote_src: yes
+    # - name: downloading promtail agent
+    #   command: curl -O -L "https://github.com/grafana/loki/releases/download/v2.0.0/promtail-linux-amd64.zip"
+    #   args: 
+    #     chdir: "{{promtail_dir}}"
+
+    # - name: unzip promtail
+    #   command: unzip "promtail-linux-amd64.zip"
+    #   args:
+    #     chdir: "{{promtail_dir}}"
+
+    - name: directory permission
+      file:
+        path: "/opt/promtail"
+        owner: "{{ file_owner }}"
+        group: "{{ file_owner }}"
+        mode: 0775
+        recurse: yes
+
+    - name: promtail +x permission
+      command: chmod a+x "promtail-linux-amd64"
+      args:
+        chdir: "{{promtail_dir}}"
+
+    - name: create_config promtial agent
+      template: src=templates/ec2_promtail.yaml dest={{promtail_dir}}/ec2_promtail.yaml   
+
+    - name: creating_service promtail agent
+      template: src=templates/promtail.service dest=/etc/systemd/system/promtail.service
+
+    - name: start service by default
+      ansible.builtin.systemd:
+          daemon_reload: yes
+    
+
+    - name: enable_service promtail agent
+      command: systemctl enable promtail
+      become: true
+
+    - name: restart_service promtail agent
+      command: systemctl restart promtail
+      become: true
+
+    - name: upgrade all apt packages
+      apt: 
+        upgrade: dist
+        force_apt_get: yes
+    
+    # - name: addtional sshkeys
+    #   template: src=templates/ssh_keys_gossamer dest=/home/ubuntu/.ssh/ssh_keys_gossamer
+
+    - name: check if a reboot is needed
+      register: reboot_required_file
+      stat: path=/var/run/reboot-required get_md5=no
+
+    - name: reboot server
+      reboot:
+        msg: "Reboot initiated by Ansible due to kernel updates"
+        connect_timeout: 5
+        reboot_timeout: 300
+        pre_reboot_delay: 0
+        post_reboot_delay: 30
+        test_command: uptime
+      when: reboot_required_file.stat.exists
